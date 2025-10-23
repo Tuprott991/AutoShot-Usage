@@ -127,17 +127,31 @@ def visualize_predictions(frames, predictions=None, predictions_2=None, predicti
                 draw.line((x + j, y, x + j, y - value), fill=tuple(color), width=8)
     return img
 
-def get_batches(frames):
-    reminder = 50 - len(frames) % 50
-    if reminder == 50:
+def get_batches(frames, batch_size=50):
+    """
+    Generate batches of frames for processing.
+    
+    Args:
+        frames: Input frames array
+        batch_size: Number of frames per batch (default: 50)
+                   Higher values use more VRAM but can be faster.
+                   Recommended: 50-200 depending on available VRAM.
+    
+    Returns:
+        Generator yielding batches of frames with padding
+    """
+    reminder = batch_size - len(frames) % batch_size
+    if reminder == batch_size:
         reminder = 0
-    frames = np.concatenate([frames[:1]] * 25 + [frames] + [frames[-1:]] * (reminder + 25), 0)
+    
+    # Padding: batch_size/2 frames before and after
+    padding = batch_size // 2
+    frames = np.concatenate([frames[:1]] * padding + [frames] + [frames[-1:]] * (reminder + padding), 0)
 
     def func():
-        for i in range(0, len(frames) - 50, 50):
-            # print(f"Processing from {i} to {i + 100}")
-            val = frames[i:i + 100]
-            # print("Actual batch shape:", val.shape)
+        for i in range(0, len(frames) - batch_size, batch_size):
+            # Each batch contains batch_size frames + padding on both sides = 2 * batch_size frames
+            val = frames[i:i + 2 * batch_size]
             yield val
 
     """This returns a generator"""
