@@ -145,16 +145,14 @@ def decode_with_ffmpeg_cuda(video_path, logger, resize_for_detection=True):
         return None
 
 def extract_specific_frames_ffmpeg_cuda(video_path, frame_indices, logger):
-    """Extract specific frames using FFmpeg with CUDA - for keyframe extraction"""
-    logger.info(f"Extracting {len(frame_indices)} specific frames with FFmpeg CUDA")
-    
-    frames = []
+    """Extract specific frames using FFmpeg with CUDA - optimized single-pass extraction"""
+    logger.info(f"Extracting {len(frame_indices)} specific frames with FFmpeg CUDA (single pass)")
     
     # Get video properties
     probe_cmd = [
         'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,r_frame_rate',
+        '-show_entries', 'stream=width,height',
         '-of', 'csv=p=0',
         video_path
     ]
@@ -164,31 +162,48 @@ def extract_specific_frames_ffmpeg_cuda(video_path, frame_indices, logger):
         parts = probe_result.stdout.strip().split(',')
         width, height = int(parts[0]), int(parts[1])
         
-        for idx in frame_indices:
-            # Use select filter to extract specific frame
-            cmd = [
-                'ffmpeg',
-                '-hwaccel', 'cuda',
-                '-i', video_path,
-                '-vf', f'select=eq(n\\,{idx})',
-                '-frames:v', '1',
-                '-f', 'rawvideo',
-                '-pix_fmt', 'rgb24',
-                'pipe:1'
-            ]
-            
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            raw_frame = process.stdout.read()
-            process.wait()
-            
-            if len(raw_frame) == width * height * 3:
+        # Build select filter for all frames at once: "eq(n,0)+eq(n,5)+eq(n,10)"
+        frame_indices_sorted = sorted(frame_indices)
+        select_expr = '+'.join([f'eq(n\\,{idx})' for idx in frame_indices_sorted])
+        
+        # Single FFmpeg command to extract all keyframes
+        cmd = [
+            'ffmpeg',
+            '-hwaccel', 'cuda',
+            '-i', video_path,
+            '-vf', f'select={select_expr}',
+            '-vsync', '0',  # Pass through frame timing
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            'pipe:1'
+        ]
+        
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        frames = []
+        frame_size = width * height * 3
+        
+        for _ in range(len(frame_indices_sorted)):
+            raw_frame = process.stdout.read(frame_size)
+            if len(raw_frame) == frame_size:
                 frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
                 frames.append(frame)
             else:
-                logger.warning(f"Failed to extract frame {idx}")
+                logger.warning(f"Failed to read frame, got {len(raw_frame)} bytes instead of {frame_size}")
                 frames.append(None)
         
-        return frames
+        process.wait()
+        
+        if process.returncode != 0:
+            stderr = process.stderr.read().decode()
+            logger.warning(f"FFmpeg returned error: {stderr}")
+            return None
+        
+        # Reorder frames to match original indices order
+        frame_map = {idx: frame for idx, frame in zip(frame_indices_sorted, frames)}
+        ordered_frames = [frame_map[idx] for idx in frame_indices]
+        
+        return ordered_frames
         
     except Exception as e:
         logger.error(f"Frame extraction failed: {e}")
