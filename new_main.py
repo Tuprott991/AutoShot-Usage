@@ -26,7 +26,7 @@ def calculate_image_hash(frame):
     image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     return imagehash.phash(image)
 
-def hamming_distance(hash1, hash2):
+def hamming_distance(hash1, hash2): 
     """Calculate Hamming distance between two hashes"""
     return hash1 - hash2
 
@@ -265,6 +265,14 @@ class KeyframeExtractor:
             return 3
         return 4
     
+    @staticmethod
+    def get_centered_frame_positions(start_frame, end_frame, keyframe_count):
+        """Get evenly distributed frame positions centered within the shot range"""
+        num_frames = end_frame - start_frame + 1
+        step = num_frames / (keyframe_count + 1)
+        positions = [int(start_frame + round(step * (i + 1))) for i in range(keyframe_count)]
+        return positions
+    
     def filter_duplicates_by_hash(self, keyframe_indices):
         """Filter duplicate frames using perceptual hashing - memory efficient version"""
         # This will be called after we have the actual frames
@@ -338,7 +346,7 @@ class KeyframeExtractor:
         if not shot_boundaries or shot_boundaries[-1] != total_frames - 1:
             shot_boundaries.append(total_frames - 1)
 
-        # STEP 3: Calculate keyframe indices
+        # STEP 3: Calculate keyframe indices (centered within each shot)
         keyframes_indices = []
         last_boundary = 0
 
@@ -348,12 +356,13 @@ class KeyframeExtractor:
             else:
                 shot_length = boundary - last_boundary
                 num_keyframes = self.get_num_keyframes(shot_length)
-                sep = shot_length / num_keyframes
-
-                for i in range(num_keyframes):
-                    new_index = int(last_boundary + sep * i)
-                    if new_index not in keyframes_indices:
-                        keyframes_indices.append(new_index)
+                
+                # Get centered positions within the shot
+                positions = self.get_centered_frame_positions(last_boundary, boundary - 1, num_keyframes)
+                
+                for pos in positions:
+                    if pos not in keyframes_indices:
+                        keyframes_indices.append(pos)
 
                 last_boundary = boundary
 
