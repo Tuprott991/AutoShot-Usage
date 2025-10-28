@@ -601,7 +601,7 @@ def parse_args():
                         help='Batch size for GPU processing (default: 50). Higher values use more VRAM. Recommended: 100-200 for 14GB VRAM')
     parser.add_argument('--use-gpu-decode', action='store_true',
                         help='Use GPU-accelerated decoding if available')
-    parser.add_argument('--hamming_threshold', type=int, default=5,
+    parser.add_argument('--hamming-threshold', type=int, default=5,
                         help='Hamming distance threshold for duplicate frame filtering (default: 5)')
     parser.add_argument('--skip-start-seconds', type=float, default=0.0,
                         help='Skip X seconds from the start of video (default: 0.0)')
