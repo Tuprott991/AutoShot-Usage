@@ -67,7 +67,7 @@ def get_video_codec(video_path):
         logging.getLogger(__name__).warning(f"Could not detect codec: {e}, defaulting to PyAV")
         return "unknown"
 
-def decode_with_ffmpeg_cuda(video_path, logger, resize_for_detection=True):
+def decode_with_ffmpeg_cuda(video_path, logger, resize_for_detection=True, start_frame=0, end_frame=None):
     """Decode video using FFmpeg CLI with CUDA acceleration - memory efficient"""
     logger.info("Using FFmpeg CLI with CUDA acceleration")
     
@@ -99,15 +99,34 @@ def decode_with_ffmpeg_cuda(video_path, logger, resize_for_detection=True):
             'ffmpeg',
             '-hwaccel', 'cuda',
             '-hwaccel_output_format', 'cuda',
-            '-i', video_path,
         ]
         
+        # Add frame range selection BEFORE input
+        if end_frame is not None:
+            num_frames = end_frame - start_frame
+            cmd.extend(['-vframes', str(num_frames)])
+        
+        cmd.extend(['-i', video_path])
+
+        # Build filter chain with trim
+        filters = []
+        
+        # Trim to frame range
+        if start_frame > 0 or end_frame is not None:
+            trim_filter = f'trim=start_frame={start_frame}'
+            if end_frame is not None:
+                trim_filter += f':end_frame={end_frame}'
+            filters.append(trim_filter)
+            filters.append('setpts=PTS-STARTPTS')  # Reset timestamps
+
         if resize_for_detection:
-            # Correct filter chain: scale on GPU, download to CPU, then convert format
-            cmd.extend(['-vf', f'scale_cuda={target_width}:{target_height},hwdownload,format=nv12,format=rgb24'])
-        else:
-            # For full resolution: just download and convert
-            cmd.extend(['-vf', 'hwdownload,format=nv12,format=rgb24'])
+            # Correct filter chain: scale on GPU
+            filters.append(f'scale_cuda={target_width}:{target_height}')
+
+        # Download to CPU, then convert format
+        filters.extend(['hwdownload', 'format=nv12', 'format=rgb24'])
+        
+        cmd.extend(['-vf', ','.join(filters)])
         
         cmd.extend([
             '-f', 'rawvideo',
@@ -209,6 +228,66 @@ def extract_specific_frames_ffmpeg_cuda(video_path, frame_indices, logger):
         logger.error(f"Frame extraction failed: {e}")
         return None
 
+def get_video_fps_and_duration(video_path):
+    """Get video FPS and total duration using ffprobe"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate,duration,nb_frames',
+            '-of', 'csv=p=0',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        parts = result.stdout.strip().split(',')
+        
+        # Parse FPS (format: "30/1" or "30000/1001")
+        fps_str = parts[0]
+        if '/' in fps_str:
+            num, den = map(int, fps_str.split('/'))
+            fps = num / den
+        else:
+            fps = float(fps_str)
+        
+        # Parse duration (seconds)
+        duration = float(parts[1]) if len(parts) > 1 else None
+        
+        # Parse total frames
+        total_frames = int(parts[2]) if len(parts) > 2 else None
+        
+        return fps, duration, total_frames
+        
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not get video info: {e}")
+        return None, None, None
+
+def calculate_frame_range(video_path, skip_start_seconds, skip_end_seconds, logger):
+    """Calculate start and end frame indices based on time skips"""
+    fps, duration, total_frames = get_video_fps_and_duration(video_path)
+    
+    if fps is None or total_frames is None:
+        logger.warning("Could not determine video FPS/frames, processing entire video")
+        return 0, None
+    
+    logger.info(f"Video info: {fps:.2f} FPS, {total_frames} frames, {duration:.2f}s duration")
+    
+    # Calculate frame indices
+    start_frame = int(skip_start_seconds * fps)
+    end_frame = total_frames - int(skip_end_seconds * fps)
+    
+    # Validate
+    if start_frame < 0:
+        start_frame = 0
+    if end_frame > total_frames:
+        end_frame = total_frames
+    if start_frame >= end_frame:
+        logger.error(f"Invalid time range: start_frame={start_frame} >= end_frame={end_frame}")
+        return 0, None
+    
+    logger.info(f"Processing frames [{start_frame} → {end_frame}] (skipping {skip_start_seconds}s start, {skip_end_seconds}s end)")
+    
+    return start_frame, end_frame
+
 def load_model(model_path, device):
     """Load the TransNetV2 model with pretrained weights"""
     logger = logging.getLogger(__name__)
@@ -233,7 +312,10 @@ def load_model(model_path, device):
     return supernet_best_f1
 
 class KeyframeExtractor:
-    def __init__(self, model, device, logits_start, logits_end, threshold, num_workers=4, use_gpu_decode=False, chunk_size=500, hamming_threshold=5, batch_size=50):
+    def __init__(self, model, device, logits_start, logits_end, threshold, 
+                 num_workers=4, use_gpu_decode=False, chunk_size=500, 
+                 hamming_threshold=5, batch_size=50, 
+                 skip_start_seconds=0.0, skip_end_seconds=0.0):
         self.model = model
         self.device = device
         self.logits_start = logits_start
@@ -244,6 +326,8 @@ class KeyframeExtractor:
         self.chunk_size = chunk_size
         self.hamming_threshold = hamming_threshold
         self.batch_size = batch_size
+        self.skip_start_seconds = skip_start_seconds
+        self.skip_end_seconds = skip_end_seconds
         self.logger = logging.getLogger(__name__)
     
     def predict(self, batch):
@@ -281,6 +365,14 @@ class KeyframeExtractor:
     def get_keyframes(self, video_path):
         """Memory-efficient keyframe extraction with codec-specific decoding"""
         
+        # Calculate frame range based on time skips
+        start_frame, end_frame = calculate_frame_range(
+            video_path, 
+            self.skip_start_seconds, 
+            self.skip_end_seconds, 
+            self.logger
+        )
+
         # Detect codec
         codec = get_video_codec(video_path)
         self.logger.info(f"Detected codec: {codec}")
@@ -293,7 +385,12 @@ class KeyframeExtractor:
         
         if use_ffmpeg and self.use_gpu_decode and torch.cuda.is_available():
             # Use FFmpeg CLI with CUDA for h264/h265 - decode at 48x27
-            frames_for_detection = decode_with_ffmpeg_cuda(video_path, self.logger, resize_for_detection=True)
+            frames_for_detection = decode_with_ffmpeg_cuda(
+                video_path, self.logger, 
+                resize_for_detection=True,
+                start_frame=start_frame,
+                end_frame=end_frame
+            )
             
             # Fallback to PyAV if FFmpeg fails
             if frames_for_detection is None:
@@ -306,7 +403,13 @@ class KeyframeExtractor:
             container = av.open(video_path)
             
             frames_for_detection = []
-            for frame in container.decode(video=0):
+            for frame_idx, frame in enumerate(container.decode(video=0)):
+                # Skip frames outside range
+                if frame_idx < start_frame:
+                    continue
+                if end_frame is not None and frame_idx >= end_frame:
+                    break
+
                 original = frame.to_ndarray(format="rgb24")
                 # Resize immediately to save memory
                 resized = cv2.resize(original, (48, 27))
@@ -369,9 +472,9 @@ class KeyframeExtractor:
         self.logger.info(f"Identified {len(keyframes_indices)} keyframe candidates")
         
         # STEP 4: Extract only the keyframes at full resolution
-        keyframes_indices_sorted = sorted(keyframes_indices)
+        adjusted_indices = [idx + start_frame for idx in keyframes_indices] # Adjust indices back to original video frame numbers
         
-        return keyframes_indices_sorted, video_path, use_ffmpeg
+        return adjusted_indices, video_path, use_ffmpeg
 
 
 def get_videos(folder_path: str) -> list:
@@ -500,6 +603,11 @@ def parse_args():
                         help='Use GPU-accelerated decoding if available')
     parser.add_argument('--hamming-threshold', type=int, default=5,
                         help='Hamming distance threshold for duplicate frame filtering (default: 5)')
+    parser.add_argument('--skip-start-seconds', type=float, default=0.0,
+                        help='Skip X seconds from the start of video (default: 0.0)')
+    parser.add_argument('--skip-end-seconds', type=float, default=0.0,
+                        help='Skip Y seconds from the end of video (default: 0.0)')
+    
     return parser.parse_args()
 
 def main():
@@ -521,6 +629,7 @@ def main():
     logger.info(f"Logits range: [{args.logits_start}:{args.logits_end}]")
     logger.info(f"Detection threshold: {args.threshold}")
     logger.info(f"Hamming threshold: {args.hamming_threshold}")
+    logger.info(f"Time skip: start={args.skip_start_seconds}s, end={args.skip_end_seconds}s")
 
     # Load model
     model = load_model(args.model_path, device)
@@ -536,6 +645,8 @@ def main():
         use_gpu_decode=args.use_gpu_decode,
         batch_size=args.batch_size,
         hamming_threshold=args.hamming_threshold,
+        skip_start_seconds=args.skip_start_seconds,
+        skip_end_seconds=args.skip_end_seconds,
     )
     
     # Create output directory
