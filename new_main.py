@@ -534,7 +534,8 @@ def main():
         threshold=args.threshold,
         num_workers=args.num_workers,
         use_gpu_decode=args.use_gpu_decode,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        hamming_threshold=args.hamming_threshold,
     )
     
     # Create output directory
