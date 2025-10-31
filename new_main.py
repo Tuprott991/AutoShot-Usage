@@ -618,9 +618,10 @@ def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num
     
     logger.info(f"✓ Successfully saved {saved_count} frames to {target_folder}")
     
-    # Save CSV file
+    # Save CSV file in csv_output folder
     if save_csv and csv_entries:
-        save_to_csv(csv_entries, save_path, folder)
+        csv_output_folder = os.path.join(save_path, "csv_output")
+        save_to_csv(csv_entries, csv_output_folder, folder)
         logger.info(f"✓ CSV file saved with {len(csv_entries)} entries")
 
 
