@@ -15,6 +15,7 @@ import time
 import argparse
 import logging
 import subprocess
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock  
 from PIL import Image
@@ -29,6 +30,38 @@ def calculate_image_hash(frame):
 def hamming_distance(hash1, hash2): 
     """Calculate Hamming distance between two hashes"""
     return hash1 - hash2
+
+def format_csv_file(frame_idx, n, fps):
+    """Format keyframe data for CSV"""
+    pts_time = round(frame_idx / fps, 2)
+    new_dict = {
+        'n': n,
+        'pts_time': pts_time,
+        'fps': fps,
+        'frame_idx': frame_idx
+    }
+    return new_dict
+
+def save_to_csv(csv_file, output_folder, file_name):
+    """Save keyframe data to CSV file"""
+    # Ensure file_name has .csv extension
+    if not file_name.endswith('.csv'):
+        file_name += '.csv'
+    
+    # Ensure output_folder exists
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    # Full path to file
+    file_path = os.path.join(output_folder, file_name)
+    
+    # Open csv file and write content
+    with open(file_path, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=['n', 'pts_time', 'fps', 'frame_idx'])
+        writer.writeheader()
+        writer.writerows(csv_file)
+    
+    logging.getLogger(__name__).info(f"CSV file saved at: {file_path}")
 
 def setup_logging(log_level):
     """Setup logging configuration for Kaggle compatibility"""
@@ -490,11 +523,17 @@ def get_videos(folder_path: str) -> list:
             files_path.append(file_path)
     return files_path
 
-def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num_workers=4, hamming_threshold=5, use_gpu_decode=False):
+def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num_workers=4, hamming_threshold=5, use_gpu_decode=False, save_csv=True):
     """Extract and save only the keyframes - memory efficient"""
     logger = logging.getLogger(__name__)
     target_folder = os.path.join(save_path, folder)
     os.makedirs(target_folder, exist_ok=True)
+    
+    # Get video FPS for CSV
+    fps, _, _ = get_video_fps_and_duration(video_path)
+    if fps is None:
+        fps = 30.0  # Default fallback
+        logger.warning(f"Could not determine FPS, using default: {fps}")
     
     logger.info(f"Extracting and saving {len(keyframe_indices)} keyframes at full resolution...")
     
@@ -532,7 +571,9 @@ def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num
     logger.info("Filtering duplicates with perceptual hashing...")
     filtered_frames = []
     filtered_indices = []
+    csv_entries = []
     prev_hash = None
+    count = 0
     
     for i, (idx, frame) in enumerate(zip(keyframe_indices, keyframes)):
         if frame is None:
@@ -545,6 +586,13 @@ def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num
         if prev_hash is None or hamming_distance(cur_hash, prev_hash) > hamming_threshold:
             filtered_frames.append(frame_bgr)
             filtered_indices.append(idx)
+            
+            # Create CSV entry for this keyframe
+            if save_csv:
+                csv_entry = format_csv_file(frame_idx=idx, n=count, fps=fps)
+                csv_entries.append(csv_entry)
+                count += 1
+            
             prev_hash = cur_hash
     
     logger.info(f"After deduplication: {len(filtered_frames)} unique keyframes")
@@ -569,6 +617,11 @@ def save_frames(keyframe_indices, video_path, use_ffmpeg, folder, save_path, num
             future.result()
     
     logger.info(f"✓ Successfully saved {saved_count} frames to {target_folder}")
+    
+    # Save CSV file
+    if save_csv and csv_entries:
+        save_to_csv(csv_entries, save_path, folder)
+        logger.info(f"✓ CSV file saved with {len(csv_entries)} entries")
 
 
 def parse_args():
@@ -696,7 +749,8 @@ def main():
                 args.save_path, 
                 args.num_workers,
                 args.hamming_threshold,
-                args.use_gpu_decode
+                args.use_gpu_decode,
+                save_csv=True
             )
             save_time = time.time() - save_start
             
