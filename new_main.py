@@ -132,19 +132,13 @@ def decode_with_ffmpeg_cuda(video_path, logger, resize_for_detection=True, start
             'ffmpeg',
             '-hwaccel', 'cuda',
             '-hwaccel_output_format', 'cuda',
+            '-i', video_path
         ]
-        
-        # Add frame range selection BEFORE input
-        if end_frame is not None:
-            num_frames = end_frame - start_frame
-            cmd.extend(['-vframes', str(num_frames)])
-        
-        cmd.extend(['-i', video_path])
 
         # Build filter chain with trim
         filters = []
         
-        # Trim to frame range
+        # Trim to frame range (this handles both start and end frames)
         if start_frame > 0 or end_frame is not None:
             trim_filter = f'trim=start_frame={start_frame}'
             if end_frame is not None:
